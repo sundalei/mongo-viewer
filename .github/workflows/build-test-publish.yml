@@ -1,0 +1,246 @@
+---
+name: "Build, Test, and Publish"
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write # Required to post comments on PRs
+  security-events: write # Required to upload SARIF reports
+  packages: write # Required to push images to ghcr.io
+
+jobs:
+  build_and_scan:
+    name: Build and Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for testing and scanning
+        uses: docker/build-push-action@v6
+        with:
+          push: false
+          load: true # Load the image into the local Docker daemon
+          tags: ${{ github.run_id }}
+          target: test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy for CRITICAL CVEs
+        uses: aquasecurity/trivy-action@0.32.0
+        with:
+          image-ref: ${{ github.run_id }}
+          format: sarif
+          exit-code: 1
+          vuln-type: os,library
+          severity: CRITICAL
+          output: trivy-results.sarif
+          scanners: vuln
+          # CRITICAL: This flag is REQUIRED to make the exit code respect the 'severity' setting.
+          # Without it, the step fails on ANY vulnerability when using SARIF format due
+          # to a known issue in the action (aquasecurity/trivy-action#386). Do not remove.
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy scan results to Github Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() # Ensure results are uploaded even if the scan fails
+        with:
+          sarif_file: trivy-results.sarif
+
+  # JOB 2: Run tests against the exact image built in the previous job.
+  integration_test:
+    name: Integration and Smoke Tests
+    runs-on: ubuntu-latest
+    needs: build_and_scan
+
+    steps:
+      - name: Set testing image environment variable
+        id: vars
+        run: |
+          IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/${{ github.run_id }}:integration-test"
+          echo "INTEGRATION_TESTING_IMAGE=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout git repo
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push to ghcr for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ steps.vars.outputs.INTEGRATION_TESTING_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+#      - name: Run Integration Tests
+#        run: |
+#          export TESTING_IMAGE=${{ steps.vars.outputs.INTEGRATION_TESTING_IMAGE }}
+#          export LDAP_ADMIN_PASSWORD=${{ secrets.LDAP_ADMIN_PASSWORD }}
+#          docker compose -f manifests/compose.yaml -f manifests/compose.ci.yaml up \
+#            --abort-on-container-exit \
+#            --exit-code-from integration-tester
+#
+#      - name: Create k3d cluster
+#        uses: AbsaOSS/k3d-action@v2
+#        with:
+#          cluster-name: "test-cluster-1"
+#          args: >-
+#            --agents 1
+#            --no-lb
+#            --k3s-arg "--no-deploy=traefik,servicelb,metrics-server@server:*"
+#
+#      - name: Smoke test deployment in k3d Kubernetes
+#        run: |
+#          kubectl apply -f manifests/namespace.yaml
+#          kubectl config set-context --current --namespace=test
+#
+#          # Create secrets and deploy OpenLDAP
+#          kubectl create secret generic ldap-secret \
+#            --from-literal=password=${{ secrets.LDAP_ADMIN_PASSWORD }}
+#
+#          kubectl create secret docker-registry dockerhub-cred \
+#            --docker-server=https://index.docker.io/v1/ \
+#            --docker-username=${{ secrets.DOCKERHUB_USERNAME }} \
+#            --docker-password=${{ secrets.DOCKERHUB_TOKEN }}
+#
+#          kubectl apply -f manifests/ldap-deployment.yaml
+#
+#          echo "Waiting for OpenLDAP server to be ready..."
+#          kubectl rollout status deployment openldap-server --timeout=2m
+#
+#          # Create secret and deploy the user-manage-ldap application
+#          kubectl create secret docker-registry regcred \
+#            --docker-server=https://ghcr.io \
+#            --docker-username=${{ github.actor }} \
+#            --docker-password=${{ secrets.GITHUB_TOKEN }}
+#
+#          export TESTING_IMAGE=${{ steps.vars.outputs.INTEGRATION_TESTING_IMAGE }}
+#          envsubst < manifests/deployment.yaml  | kubectl apply -f -
+#
+#          echo "Waiting for user-manage-ldap to be ready..."
+#          kubectl rollout status deployment user-manage-ldap --timeout=2m
+#
+#          echo "--- Checking final pod status after waiting ---"
+#          kubectl get pods -o wide
+#
+#          echo "Applying the Kubernetes Job..."
+#          kubectl apply -f manifests/test-job.yaml
+#
+#          # `kubectl wait` will automatically fail if the Job fails or times out,
+#          # which will then fail this entire workflow step.
+#          echo "Waiting for Job completion in namespace test-ns..."
+#          set +e
+#          kubectl wait --for=condition=complete job/curl-smoke-test --timeout=5m
+#          wait_status=$?
+#          set -e
+#
+#          echo "--- Pod Logs ---"
+#
+#          POD_NAME=$(kubectl get pods \
+#            --selector=job-name=curl-smoke-test \
+#            -o jsonpath='{.items[0].metadata.name}')
+#
+#          if [ -n "$POD_NAME" ]; then
+#            kubectl logs "$POD_NAME"
+#          else
+#            echo "Could not find pod for job to retrieve logs."
+#          fi
+#          echo "--- End Logs ---"
+#
+#          # Step 3: Now, check if the wait command failed and exit
+#          # if necessary.
+#          if [ $wait_status -ne 0 ]; then
+#            echo "Job failed or timed out."
+#            exit 1
+#          fi
+#
+#          echo "Job completed successfully!"
+
+  publish:
+    name: Publish Final Image
+    runs-on: ubuntu-latest
+    needs: integration_test
+
+    steps:
+      - name: Checkout git repo
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata for final image build
+        id: docker_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/mongo-viewer
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ endsWith(github.ref, github.event.repository.default_branch) }}
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+
+      - name: Docker build and push to Docker Hub
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Find comment for image tags
+        uses: peter-evans/find-comment@v3
+        if: github.event_name == 'pull_request'
+        id: fc
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: "github-actions[bot]"
+          body-includes: "Docker image tag(s) pushed"
+
+      - name: Create or update comment for image tags
+        uses: peter-evans/create-or-update-comment@v4
+        if: github.event_name == 'pull_request'
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            Docker image tag(s) pushed:
+            ```text
+            ${{ steps.docker_meta.outputs.tags }}
+            ```
+            Labels added to images:
+            ```text
+            ${{ steps.docker_meta.outputs.labels }}
+            ```
+          edit-mode: replace
