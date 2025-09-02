@@ -16,7 +16,7 @@ public class MongoController {
 
   private final MongoClient mongoClient;
 
-  public MongoController(MongoClient mongoClient) {
+  public MongoController(final MongoClient mongoClient) {
     this.mongoClient = mongoClient;
   }
 
