@@ -16,12 +16,14 @@ public class MongoController {
 
   private final MongoClient mongoClient;
 
+  private static final int MAX_RESULTS = 200;
+
   public MongoController(final MongoClient mongoClient) {
     this.mongoClient = mongoClient;
   }
 
   /**
-   * Get database list
+   * Get database list.
    *
    * @return A list of all database names on the MongoDB server.
    */
@@ -59,7 +61,7 @@ public class MongoController {
     MongoTemplate specificMongoTemplate = new MongoTemplate(mongoClient, dbName);
     BasicQuery basicQuery = new BasicQuery(query);
     // Limit results to avoid overwhelming the client.
-    basicQuery.limit(200);
+    basicQuery.limit(MAX_RESULTS);
     return specificMongoTemplate.find(basicQuery, Document.class, collectionName);
   }
 
